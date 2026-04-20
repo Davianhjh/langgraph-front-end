@@ -1,36 +1,47 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# FastAPI Agent Chat Frontend
 
-## Getting Started
+Next.js + Vercel AI SDK frontend client for a Python FastAPI backend.
 
-First, run the development server:
+## Features
+
+- Multi-conversation sidebar with collapse/expand and new conversation creation
+- Startup history loading from `/history`
+- Dialog restore from `/dialog?thread_id=...`
+- 32-char random `thread_id` for each new conversation
+- Text + file upload in each chat message
+- Streaming response from `/chat` SSE endpoint
+- Markdown rendering for assistant replies
+- Timestamp display for every message in `yyyy-MM-dd HH:mm:ss`
+
+## Setup
+
+1. Install dependencies:
+
+```bash
+npm install
+```
+
+2. Configure backend address in `.env.local`:
+
+```bash
+FASTAPI_BASE_URL=http://127.0.0.1:8000
+```
+
+3. Run development server:
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open http://localhost:3000
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Frontend API Routes
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- `/api/history` -> proxies to `${FASTAPI_BASE_URL}/history`
+- `/api/dialog` -> proxies to `${FASTAPI_BASE_URL}/dialog`
+- `/api/chat` -> proxies to `${FASTAPI_BASE_URL}/chat`, converts SSE events to plain text stream for Vercel AI SDK `TextStreamChatTransport`
 
-## Learn More
+## Notes
 
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- The chat proxy forwards `thread_id`, `message`, `query`, `input`, and uploaded files to maximize compatibility with existing FastAPI handlers.
+- History sidebar label shows the first message, truncated to 12 chars, with full text in hover tooltip.

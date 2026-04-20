@@ -1,26 +1,117 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --bg-main: #f6f4ef;
+  --bg-panel: #fcfaf5;
+  --bg-strong: #131515;
+  --text-main: #1b1f24;
+  --text-soft: #5f6a78;
+  --accent: #f26a2e;
+  --accent-soft: #ffe3d6;
+  --line: #e6dfd2;
+  --assistant: #f9f3e8;
+  --user: #e8f4ff;
+  --shadow: 0 16px 50px rgba(17, 20, 24, 0.12);
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --color-background: var(--bg-main);
+  --color-foreground: var(--text-main);
+  --font-sans: var(--font-manrope);
+  --font-mono: var(--font-space-grotesk);
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background:
+    radial-gradient(circle at 15% 10%, #fff7e4 0%, transparent 42%),
+    radial-gradient(circle at 95% 85%, #e7f4ff 0%, transparent 32%),
+    var(--bg-main);
+  color: var(--text-main);
+  font-family: var(--font-manrope), sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.chat-shell {
+  min-height: 100dvh;
+}
+
+.sidebar-scroll,
+.messages-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #c8c1b5 transparent;
+}
+
+.bubble-markdown p {
+  margin: 0;
+  line-height: 1.6;
+}
+
+.bubble-markdown p + p {
+  margin-top: 0.6rem;
+}
+
+.bubble-markdown pre {
+  overflow-x: auto;
+  border-radius: 0.75rem;
+  background: #101215;
+  color: #f0f4f8;
+  padding: 0.8rem;
+  margin: 0.8rem 0;
+  font-family: var(--font-space-grotesk), monospace;
+}
+
+.bubble-markdown code {
+  font-family: var(--font-space-grotesk), monospace;
+  background: rgba(17, 20, 24, 0.08);
+  padding: 0.1rem 0.3rem;
+  border-radius: 0.3rem;
+}
+
+.bubble-markdown pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.bubble-markdown ul,
+.bubble-markdown ol {
+  margin: 0.65rem 0;
+  padding-left: 1.1rem;
+}
+
+.bubble-markdown blockquote {
+  border-left: 3px solid var(--accent);
+  margin: 0.75rem 0;
+  padding-left: 0.75rem;
+  color: #596474;
+}
+
+.bubble-markdown a {
+  color: #1f5ea8;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  word-break: break-all;
+}
+
+.bubble-markdown a:hover {
+  color: #17477d;
+}
+
+.typing-caret {
+  display: inline-block;
+  width: 0.55ch;
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  from,
+  to {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0;
+  }
 }
