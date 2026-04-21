@@ -4,8 +4,19 @@ function backendBaseUrl() {
   return process.env.FASTAPI_BASE_URL ?? "http://127.0.0.1:8000";
 }
 
-export async function GET() {
-  const response = await fetch(`${backendBaseUrl()}/history`, {
+export async function GET(request: Request) {
+  const url = new URL(request.url);
+  const params = url.searchParams;
+
+  const user_id = params.get("user_id") ?? "123";
+  const page = params.get("page") ?? "1";
+  const page_size = params.get("page_size") ?? "10";
+
+  const backendUrl = `${backendBaseUrl()}/history?user_id=${encodeURIComponent(
+    user_id,
+  )}&page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(page_size)}`;
+
+  const response = await fetch(backendUrl, {
     method: "GET",
     headers: {
       Accept: "application/json",

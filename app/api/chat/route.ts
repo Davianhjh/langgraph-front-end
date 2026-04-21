@@ -91,18 +91,20 @@ function serializeMessagesForBackend(messages: UIMessage[]) {
 
 function buildChatPayload(options: {
   thread_id: string;
+  user_id: string;
   content: string;
   files: Array<{ url: string; filename?: string; mediaType?: string }>;
   messages: UIMessage[];
 }) {
-  const { thread_id, content, files, messages } = options;
+  const { thread_id, user_id, content, files, messages } = options;
   const serializedMessages = serializeMessagesForBackend(messages);
   const fallbackMessages = content.trim()
     ? [{ role: "user", content }]
     : serializedMessages;
 
   return {
-    thread_id: thread_id,
+    thread_id,
+    user_id,
     query: content,
     messages: serializedMessages.length > 0 ? serializedMessages : fallbackMessages,
     files: files.map((file) => ({
@@ -221,9 +223,8 @@ function sseToTextStream(stream: ReadableStream<Uint8Array>) {
 export async function POST(request: Request) {
   const body = (await request.json()) as AnyRecord;
   const messages = (body.messages as UIMessage[]) ?? [];
-  const thread_id =
-    extractString(body.thread_id) ||
-    "";
+  const thread_id = extractString(body.thread_id) || "";
+  const user_id = extractString(body.user_id) || "123";
 
   const latestUserMessage = [...messages]
     .reverse()
@@ -232,7 +233,7 @@ export async function POST(request: Request) {
   const parts = latestUserMessage?.parts ?? [];
   const content = extractTextFromParts(parts as unknown[]);
   const files = extractFileParts(parts as unknown[]);
-  const payload = buildChatPayload({ thread_id, content, files, messages });
+  const payload = buildChatPayload({ thread_id, user_id, content, files, messages });
 
   const upstreamResponse = await fetch(`${backendBaseUrl()}/chat`, {
     method: "POST",

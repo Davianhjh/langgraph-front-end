@@ -123,11 +123,16 @@ function firstLine(input: string) {
 }
 
 function limitTitle(input: string) {
-  const text = firstLine(input);
-  if (text.length <= 12) {
-    return text;
+  // display at most 2 lines of 10 characters each (20 chars total)
+  const text = String(input ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return "新会话";
+  if (text.length <= 10) return text;
+  if (text.length <= 20) {
+    // insert a line break after 10 chars
+    return `${text.slice(0, 10)}\n${text.slice(10)}`;
   }
-  return `${text.slice(0, 12)}...`;
+  // longer than 20: truncate and show ellipsis at end of second line
+  return `${text.slice(0, 10)}\n${text.slice(10, 20)}...`;
 }
 
 function toDataUrl(file: File): Promise<string> {
@@ -142,6 +147,7 @@ function toDataUrl(file: File): Promise<string> {
 function normalizeHistory(payload: unknown): Conversation[] {
   const box = payload as Record<string, unknown>;
   const source =
+    (Array.isArray(box?.dialogs) && box.dialogs) ||
     (Array.isArray(payload) && payload) ||
     (Array.isArray(box?.data) && box.data) ||
     (Array.isArray(box?.items) && box.items) ||
@@ -156,20 +162,21 @@ function normalizeHistory(payload: unknown): Conversation[] {
 
       const row = item as Record<string, unknown>;
       const threadId =
-        String(row.thread_id ?? row.threadId ?? row.id ?? row.session_id ?? "").trim();
+        String(row.thread_id ?? "").trim();
 
       if (!threadId) {
         return null;
       }
 
       const fullTitle =
+        String(row.dialog_title ?? "").trim() ||
         extractText(
-          row.first_message ?? row.firstMessage ?? row.message ?? row.title ?? row.preview,
+          row.first_message ?? row.firstMessage ?? row.message ?? row.preview,
         ) || `会话 ${index + 1}`;
 
       return {
         threadId,
-        title: firstLine(fullTitle),
+        title: fullTitle,
         messages: [],
         loaded: false,
       } as Conversation;
@@ -204,12 +211,13 @@ function normalizeDialog(payload: unknown): ChatMessage[] {
         role: normalizeRole(row.role ?? row.sender ?? row.type),
         content,
         timestamp: parseDateString(
-          row.timestamp ?? row.time ?? row.created_at ?? row.createdAt,
+          row.timestamp ?? row.time ?? row.create_time ?? row.createTime ?? row.created_at ?? row.createdAt,
         ),
       } as ChatMessage;
     })
     .filter((item): item is ChatMessage => Boolean(item));
 }
+
 
 function normalizeReplyText(input: string) {
   return input
@@ -233,6 +241,11 @@ export default function Home() {
   const [collapsed, setCollapsed] = useState(false);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeThreadId, setActiveThreadId] = useState("");
+  const sidebarRef = useRef<HTMLDivElement | null>(null);
+  const [historyPage, setHistoryPage] = useState(1);
+  const [historyPageSize] = useState(10);
+  const [historyHasMore, setHistoryHasMore] = useState(true);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [input, setInput] = useState("");
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [booting, setBooting] = useState(true);
@@ -246,28 +259,61 @@ export default function Home() {
     [conversations, activeThreadId],
   );
 
-  useEffect(() => {
-    messageBottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [activeConversation?.messages]);
+  const messagesContainerRef = useRef<HTMLDivElement | null>(null);
+
+
+  async function loadHistoryPage(page: number) {
+    if (historyLoading) return;
+    setHistoryLoading(true);
+    try {
+      const response = await fetch(
+        `/api/history?user_id=123&page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(
+          historyPageSize,
+        )}`,
+        { cache: "no-store" },
+      );
+
+      if (!response.ok) {
+        throw new Error("加载历史会话失败");
+      }
+
+      const data = (await response.json()) as unknown;
+      const items = normalizeHistory(data);
+
+      if (items.length === 0 && page === 1) {
+        const threadId = generateThreadId();
+        setConversations([{ threadId, title: "新会话", messages: [], loaded: true }]);
+        setActiveThreadId(threadId);
+        setHistoryHasMore(false);
+        return;
+      }
+
+      setConversations((prev) => {
+        const existing = new Set(prev.map((c) => c.threadId));
+        const toAppend = items.filter((c) => !existing.has(c.threadId));
+        return [...prev, ...toAppend];
+      });
+
+      if (page === 1 && items.length > 0) {
+        setActiveThreadId(items[0].threadId);
+      }
+
+      if (items.length < historyPageSize) {
+        setHistoryHasMore(false);
+      } else {
+        setHistoryHasMore(true);
+      }
+
+      setHistoryPage(page);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }
 
   useEffect(() => {
     const init = async () => {
       try {
-        const response = await fetch("/api/history", { cache: "no-store" });
-        if (!response.ok) {
-          throw new Error("加载历史对话失败");
-        }
-        const data = (await response.json()) as unknown;
-        const historyItems = normalizeHistory(data);
-
-        if (historyItems.length === 0) {
-          const threadId = generateThreadId();
-          setConversations([{ threadId, title: "新会话", messages: [], loaded: true }]);
-          setActiveThreadId(threadId);
-        } else {
-          setConversations(historyItems);
-          setActiveThreadId(historyItems[0].threadId);
-        }
+        await loadHistoryPage(1);
       } catch {
         const threadId = generateThreadId();
         setConversations([{ threadId, title: "新会话", messages: [], loaded: true }]);
@@ -281,49 +327,108 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    const loadDialog = async () => {
-      if (!activeThreadId) {
-        return;
-      }
+    // load initial dialog page when switching to a thread
+    const loadInitial = async () => {
+      if (!activeThreadId) return;
 
       const target = conversations.find((item) => item.threadId === activeThreadId);
-      if (!target || target.loaded) {
-        return;
-      }
+      if (!target || target.loaded) return;
 
-      try {
-        const response = await fetch(
-          `/api/dialog?thread_id=${encodeURIComponent(activeThreadId)}`,
-          { cache: "no-store" },
-        );
-        if (!response.ok) {
-          throw new Error("加载会话失败");
-        }
-
-        const data = (await response.json()) as unknown;
-        const messages = normalizeDialog(data);
-
-        setConversations((prev) =>
-          prev.map((item) => {
-            if (item.threadId !== activeThreadId) {
-              return item;
-            }
-
-            const title = messages[0]?.content ? firstLine(messages[0].content) : item.title;
-            return { ...item, messages, loaded: true, title };
-          }),
-        );
-      } catch {
-        setConversations((prev) =>
-          prev.map((item) =>
-            item.threadId === activeThreadId ? { ...item, loaded: true } : item,
-          ),
-        );
-      }
+      await loadDialogPageForThread(activeThreadId, 1);
     };
 
-    void loadDialog();
+    void loadInitial();
   }, [activeThreadId, conversations]);
+
+  async function loadDialogPageForThread(threadId: string, page: number) {
+    const pageSize = 10;
+    // find conversation
+    const conv = conversations.find((c) => c.threadId === threadId);
+    if (!conv) return;
+
+    // avoid duplicate loads
+    const isLoading = (conv as any).dialogLoading as boolean | undefined;
+    const hasMore = (conv as any).dialogHasMore as boolean | undefined;
+    if (isLoading) return;
+    if (page > 1 && hasMore === false) return;
+
+    // set loading flag
+    setConversations((prev) =>
+      prev.map((c) =>
+        c.threadId === threadId
+          ? ({ ...c, loaded: true, dialogLoading: true } as Conversation)
+          : c,
+      ),
+    );
+
+    const container = messagesContainerRef.current;
+    const prevScrollHeight = container?.scrollHeight ?? 0;
+    const prevScrollTop = container?.scrollTop ?? 0;
+
+    try {
+      const response = await fetch(
+        `/api/dialog?thread_id=${encodeURIComponent(threadId)}&user_id=123&page=${encodeURIComponent(
+          String(page),
+        )}&page_size=${encodeURIComponent(String(pageSize))}`,
+        { cache: "no-store" },
+      );
+      if (!response.ok) throw new Error("加载会话失败");
+
+      const data = (await response.json()) as unknown;
+      const items = normalizeDialog(data);
+
+      // The backend provides `messages` where the 1st element is the bottom-most
+      // message for that page. We must reverse each page chunk so UI renders
+      // messages in top->bottom order, and prepend older pages above existing.
+      const chunk = items.slice().reverse();
+
+      setConversations((prev) =>
+        prev.map((c) => {
+          if (c.threadId !== threadId) return c;
+
+          const existing = c.messages ?? [];
+
+          if (page === 1) {
+            return {
+              ...c,
+              messages: chunk,
+              loaded: true,
+              dialogLoading: false,
+              ...({ dialogPage: 1, dialogHasMore: items.length >= pageSize } as any),
+            } as Conversation;
+          }
+
+          // prepend older items for page > 1, avoiding duplicates
+          const existingIds = new Set(existing.map((m) => m.id));
+          const toPrepend = chunk.filter((m) => !existingIds.has(m.id));
+          return {
+            ...c,
+            messages: [...toPrepend, ...existing],
+            loaded: true,
+            dialogLoading: false,
+            ...( { dialogPage: page, dialogHasMore: items.length >= pageSize } as any ),
+          } as Conversation;
+        }),
+      );
+
+      // adjust scroll: if initial page, scroll to bottom; if prepending, preserve position
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const newContainer = messagesContainerRef.current;
+      if (page === 1) {
+        messageBottomRef.current?.scrollIntoView({ behavior: "auto" });
+      } else if (newContainer) {
+        const newScrollHeight = newContainer.scrollHeight;
+        newContainer.scrollTop = newScrollHeight - prevScrollHeight + prevScrollTop;
+      }
+    } catch (err) {
+      // mark as loaded to avoid retry loops
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.threadId === threadId ? ({ ...c, loaded: true, dialogLoading: false } as Conversation) : c,
+        ),
+      );
+    }
+  }
 
   const createNewDialog = () => {
     const threadId = generateThreadId();
@@ -394,6 +499,10 @@ export default function Home() {
         isStreaming: true,
       },
     ]);
+    // ensure view scrolls to bottom after adding user & skeleton messages
+    setTimeout(() => {
+      messageBottomRef.current?.scrollIntoView({ behavior: "auto" });
+    }, 50);
 
     setConversations((prev) =>
       prev.map((item) => {
@@ -401,11 +510,7 @@ export default function Home() {
           return item;
         }
 
-        if (item.title !== "新会话") {
-          return item;
-        }
-
-        return { ...item, title: firstLine(trimmed || fileNames.join(", ")) };
+        return item;
       }),
     );
 
@@ -441,7 +546,7 @@ export default function Home() {
         messageId: undefined,
         messages: [outgoingMessage],
         abortSignal: undefined,
-        body: { threadId },
+        body: { thread_id: threadId },
       });
 
       const reader = stream.getReader();
@@ -466,6 +571,8 @@ export default function Home() {
               : message,
           ),
         );
+        // auto-scroll to bottom during typewriter streaming
+        messageBottomRef.current?.scrollIntoView({ behavior: "smooth" });
       }, typeInterval);
 
       try {
@@ -529,13 +636,15 @@ export default function Home() {
     } finally {
       setSending(false);
     }
+    // ensure view scrolls to bottom after send
+    messageBottomRef.current?.scrollIntoView({ behavior: "smooth" });
   };
 
   return (
-    <div className="chat-shell flex w-full">
+    <div className="chat-shell flex h-screen w-full overflow-hidden">
       <aside
         className={clsx(
-          "border-r border-[var(--line)] bg-[var(--bg-panel)] transition-all duration-300",
+          "border-r border-[var(--line)] bg-[var(--bg-panel)] transition-all duration-300 h-full",
           collapsed ? "w-[74px]" : "w-[290px]",
         )}
       >
@@ -559,7 +668,18 @@ export default function Home() {
             )}
           </div>
 
-          <div className="sidebar-scroll flex-1 overflow-y-auto px-2 py-3">
+          <div
+            ref={sidebarRef}
+            onScroll={() => {
+              const el = sidebarRef.current;
+              if (!el || historyLoading || !historyHasMore) return;
+              const threshold = 120;
+              if (el.scrollTop + el.clientHeight >= el.scrollHeight - threshold) {
+                void loadHistoryPage(historyPage + 1);
+              }
+            }}
+            className="sidebar-scroll flex-1 overflow-y-auto px-2 py-3"
+          >
             {conversations.map((conversation) => {
               const active = conversation.threadId === activeThreadId;
               return (
@@ -567,7 +687,7 @@ export default function Home() {
                   key={conversation.threadId}
                   type="button"
                   onClick={() => setActiveThreadId(conversation.threadId)}
-                  title={firstLine(conversation.title)}
+                  title={conversation.title}
                   className={clsx(
                     "mb-2 flex w-full items-center gap-2 rounded-xl border px-2 py-2 text-left transition",
                     active
@@ -580,7 +700,10 @@ export default function Home() {
                     {active ? "●" : "○"}
                   </span>
                   {!collapsed && (
-                    <span className="text-sm text-[var(--text-main)]">
+                    <span
+                      className="text-sm text-[var(--text-main)]"
+                      style={{ whiteSpace: "pre-line" }}
+                    >
                       {limitTitle(conversation.title)}
                     </span>
                   )}
@@ -591,15 +714,30 @@ export default function Home() {
         </div>
       </aside>
 
-      <main className="flex min-h-dvh flex-1 flex-col">
-        <header className="border-b border-[var(--line)] bg-white/70 px-5 py-4 backdrop-blur">
+      <main className="flex h-screen flex-1 flex-col overflow-hidden">
+        <header className="shrink-0 border-b border-[var(--line)] bg-white/70 px-5 py-4 backdrop-blur">
           <h1 className="font-mono text-lg font-semibold tracking-tight">AI Agent 对话</h1>
           <p className="mt-1 text-sm text-[var(--text-soft)]">
-            当前线程: {activeThreadId || "-"}
+            当前会话ID: {activeThreadId || "-"}
           </p>
         </header>
 
-        <section className="messages-scroll flex-1 overflow-y-auto px-4 py-5 md:px-8">
+        <section
+          ref={messagesContainerRef}
+          onScroll={(e) => {
+            const el = e.currentTarget as HTMLDivElement;
+            if (!activeConversation) return;
+            const meta = (activeConversation as any);
+            if (meta.dialogLoading) return;
+            if (meta.dialogHasMore === false) return;
+            const threshold = 120;
+            if (el.scrollTop <= threshold) {
+              const next = (meta.dialogPage ?? 1) + 1;
+              void loadDialogPageForThread(activeConversation.threadId, next);
+            }
+          }}
+          className="messages-scroll flex-1 overflow-y-auto px-4 py-5 md:px-8"
+        >
           {booting ? (
             <div className="rounded-xl border border-[var(--line)] bg-white p-6 text-sm text-[var(--text-soft)]">
               正在加载历史会话...
@@ -665,7 +803,7 @@ export default function Home() {
           )}
         </section>
 
-        <footer className="border-t border-[var(--line)] bg-[var(--bg-panel)] p-4">
+        <footer className="shrink-0 border-t border-[var(--line)] bg-[var(--bg-panel)] p-4">
           <form
             ref={formRef}
             onSubmit={handleSend}

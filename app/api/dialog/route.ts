@@ -6,13 +6,23 @@ function backendBaseUrl() {
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
-  const threadId = url.searchParams.get("thread_id");
+  const params = url.searchParams;
+  const threadId = params.get("thread_id");
 
   if (!threadId) {
     return Response.json({ error: "thread_id is required" }, { status: 400 });
   }
 
-  const target = `${backendBaseUrl()}/dialog?thread_id=${encodeURIComponent(threadId)}`;
+  const user_id = params.get("user_id") ?? "123";
+  const page = params.get("page") ?? "1";
+  const page_size = params.get("page_size") ?? "10";
+
+  const target = `${backendBaseUrl()}/dialog?thread_id=${encodeURIComponent(
+    threadId,
+  )}&user_id=${encodeURIComponent(user_id)}&page=${encodeURIComponent(
+    page,
+  )}&page_size=${encodeURIComponent(page_size)}`;
+
   const response = await fetch(target, {
     method: "GET",
     headers: {
