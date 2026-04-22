@@ -4,6 +4,14 @@ export const dynamic = "force-dynamic";
 
 type AnyRecord = Record<string, unknown>;
 
+type UploadedFile = {
+  file_url: string;
+  file_name: string;
+  file_ext: string;
+  file_size: number;
+  mime_type: string;
+};
+
 function backendBaseUrl() {
   return process.env.FASTAPI_BASE_URL ?? "http://127.0.0.1:8000";
 }
@@ -50,12 +58,16 @@ function extractTextFromParts(parts: unknown[]): string {
     .join("\n");
 }
 
-function extractFileParts(parts: unknown[]): Array<{
-  url: string;
-  filename?: string;
-  mediaType?: string;
-}> {
-  const files: Array<{ url: string; filename?: string; mediaType?: string }> = [];
+function fileExtFromName(name: string): string {
+  const dotIndex = name.lastIndexOf(".");
+  if (dotIndex < 0 || dotIndex === name.length - 1) {
+    return "";
+  }
+  return name.slice(dotIndex + 1).toLowerCase();
+}
+
+function extractFileParts(parts: unknown[]): UploadedFile[] {
+  const files: UploadedFile[] = [];
 
   for (const part of parts) {
     if (!part || typeof part !== "object") {
@@ -67,14 +79,53 @@ function extractFileParts(parts: unknown[]): Array<{
       continue;
     }
 
+    const fileName = typeof row.filename === "string" ? row.filename : "";
+    const mimeType = typeof row.mediaType === "string" ? row.mediaType : "application/octet-stream";
+
     files.push({
-      url: row.url,
-      filename: typeof row.filename === "string" ? row.filename : undefined,
-      mediaType: typeof row.mediaType === "string" ? row.mediaType : undefined,
+      file_url: row.url,
+      file_name: fileName,
+      file_ext: fileExtFromName(fileName),
+      file_size: 0,
+      mime_type: mimeType,
     });
   }
 
   return files;
+}
+
+function extractUploadedFiles(value: unknown): UploadedFile[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return null;
+      }
+
+      const row = item as AnyRecord;
+      const fileUrl = extractString(row.file_url ?? row.url ?? row.data);
+      if (!fileUrl) {
+        return null;
+      }
+
+      const fileName = extractString(row.file_name ?? row.filename);
+      const mimeType = extractString(row.mime_type ?? row.media_type ?? row.mediaType) || "application/octet-stream";
+      const fileExt = extractString(row.file_ext) || fileExtFromName(fileName);
+      const fileSizeRaw = row.file_size;
+      const fileSize = typeof fileSizeRaw === "number" ? fileSizeRaw : Number(fileSizeRaw ?? 0);
+
+      return {
+        file_url: fileUrl,
+        file_name: fileName,
+        file_ext: fileExt,
+        file_size: Number.isFinite(fileSize) ? fileSize : 0,
+        mime_type: mimeType,
+      } as UploadedFile;
+    })
+    .filter((item): item is UploadedFile => Boolean(item));
 }
 
 function serializeMessagesForBackend(messages: UIMessage[]) {
@@ -93,7 +144,7 @@ function buildChatPayload(options: {
   thread_id: string;
   user_id: string;
   content: string;
-  files: Array<{ url: string; filename?: string; mediaType?: string }>;
+  files: UploadedFile[];
   messages: UIMessage[];
 }) {
   const { thread_id, user_id, content, files, messages } = options;
@@ -108,11 +159,16 @@ function buildChatPayload(options: {
     query: content,
     messages: serializedMessages.length > 0 ? serializedMessages : fallbackMessages,
     files: files.map((file) => ({
-      filename: file.filename,
-      media_type: file.mediaType,
-      mediaType: file.mediaType,
-      url: file.url,
-      data: file.url,
+      file_url: file.file_url,
+      file_name: file.file_name,
+      file_ext: file.file_ext,
+      file_size: file.file_size,
+      mime_type: file.mime_type,
+      filename: file.file_name,
+      media_type: file.mime_type,
+      mediaType: file.mime_type,
+      url: file.file_url,
+      data: file.file_url,
     })),
   };
 }
@@ -232,7 +288,9 @@ export async function POST(request: Request) {
 
   const parts = latestUserMessage?.parts ?? [];
   const content = extractTextFromParts(parts as unknown[]);
-  const files = extractFileParts(parts as unknown[]);
+  const filesFromBody = extractUploadedFiles(body.files);
+  const filesFromParts = extractFileParts(parts as unknown[]);
+  const files = filesFromBody.length > 0 ? filesFromBody : filesFromParts;
   const payload = buildChatPayload({ thread_id, user_id, content, files, messages });
 
   const upstreamResponse = await fetch(`${backendBaseUrl()}/chat`, {

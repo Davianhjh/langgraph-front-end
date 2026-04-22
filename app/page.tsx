@@ -1,6 +1,6 @@
 "use client";
 
-import { TextStreamChatTransport, type FileUIPart, type UIMessage } from "ai";
+import { TextStreamChatTransport, type UIMessage } from "ai";
 import clsx from "clsx";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -14,6 +14,7 @@ type ChatMessage = {
   content: string;
   timestamp: string;
   attachments?: string[];
+  files?: UploadedFile[];
   isStreaming?: boolean;
 };
 
@@ -26,6 +27,16 @@ type Conversation = {
   dialogHasMore?: boolean;
   dialogPage?: number;
 };
+
+type UploadedFile = {
+  file_url: string;
+  file_name: string;
+  file_ext: string;
+  file_size: number;
+  mime_type: string;
+};
+
+const HISTORY_PAGE_SIZE = 10;
 
 const transport = new TextStreamChatTransport({ api: "/api/chat" });
 
@@ -125,15 +136,6 @@ function limitTitle(input: string) {
   return text || "新会话";
 }
 
-function toDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(new Error(`读取文件失败: ${file.name}`));
-    reader.readAsDataURL(file);
-  });
-}
-
 function normalizeHistory(payload: unknown): Conversation[] {
   const box = payload as Record<string, unknown>;
   const source =
@@ -196,6 +198,24 @@ function normalizeDialog(payload: unknown): ChatMessage[] {
         return null;
       }
 
+      const rawFiles = Array.isArray(row.files) ? row.files : [];
+      const files: UploadedFile[] = rawFiles
+        .slice(0, 3)
+        .map((f: unknown) => {
+          if (!f || typeof f !== "object") return null;
+          const rf = f as Record<string, unknown>;
+          const file_url = String(rf.file_url ?? "");
+          if (!file_url) return null;
+          return {
+            file_url,
+            file_name: String(rf.file_name ?? ""),
+            file_ext: String(rf.file_ext ?? ""),
+            file_size: Number(rf.file_size ?? 0),
+            mime_type: String(rf.mime_type ?? "application/octet-stream"),
+          } as UploadedFile;
+        })
+        .filter((f): f is UploadedFile => f !== null);
+
       return {
         id: String(row.id ?? `${Date.now()}-${index}`),
         role: normalizeRole(row.role ?? row.sender ?? row.type),
@@ -203,6 +223,7 @@ function normalizeDialog(payload: unknown): ChatMessage[] {
         timestamp: parseDateString(
           row.timestamp ?? row.time ?? row.create_time ?? row.createTime ?? row.created_at ?? row.createdAt,
         ),
+        ...(files.length > 0 ? { files } : {}),
       } as ChatMessage;
     })
     .filter((item): item is ChatMessage => Boolean(item));
@@ -264,11 +285,13 @@ export default function Home() {
   }, []);
 
   const [historyPage, setHistoryPage] = useState(1);
-  const [historyPageSize] = useState(10);
   const [historyHasMore, setHistoryHasMore] = useState(true);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [input, setInput] = useState("");
-  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [uploadHint, setUploadHint] = useState("");
+  const [showUploadFailToast, setShowUploadFailToast] = useState(false);
   const [booting, setBooting] = useState(true);
   const [sending, setSending] = useState(false);
   const [errorText, setErrorText] = useState("");
@@ -277,6 +300,9 @@ export default function Home() {
   const [fontSize, setFontSize] = useState("medium");
   const messageBottomRef = useRef<HTMLDivElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const historyLoadingRef = useRef(false);
+  const uploadFailToastTimerRef = useRef<number | null>(null);
 
   const activeConversation = useMemo(
     () => conversations.find((item) => item.threadId === activeThreadId),
@@ -285,14 +311,23 @@ export default function Home() {
 
   const messagesContainerRef = useRef<HTMLDivElement | null>(null);
 
+  useEffect(() => {
+    return () => {
+      if (uploadFailToastTimerRef.current !== null) {
+        window.clearTimeout(uploadFailToastTimerRef.current);
+      }
+    };
+  }, []);
+
 
   const loadHistoryPage = useCallback(async (page: number) => {
-    if (historyLoading) return;
+    if (historyLoadingRef.current) return;
+    historyLoadingRef.current = true;
     setHistoryLoading(true);
     try {
       const response = await fetch(
         `/api/history?user_id=123&page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(
-          historyPageSize,
+          HISTORY_PAGE_SIZE,
         )}`,
         { cache: "no-store" },
       );
@@ -322,7 +357,7 @@ export default function Home() {
         setActiveThreadId(items[0].threadId);
       }
 
-      if (items.length < historyPageSize) {
+      if (items.length < HISTORY_PAGE_SIZE) {
         setHistoryHasMore(false);
       } else {
         setHistoryHasMore(true);
@@ -330,9 +365,10 @@ export default function Home() {
 
       setHistoryPage(page);
     } finally {
+      historyLoadingRef.current = false;
       setHistoryLoading(false);
     }
-  }, [historyLoading, historyPageSize]);
+  }, []);
 
   useEffect(() => {
     const init = async () => {
@@ -484,11 +520,95 @@ export default function Home() {
     );
   };
 
+  const handleUploadFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const selected = event.target.files?.[0];
+    event.target.value = "";
+
+    if (!selected) {
+      return;
+    }
+
+    if (sending) {
+      return;
+    }
+
+    if (uploadedFiles.length >= 3) {
+      setUploadHint("一个输入框最多上传 3 个文件");
+      return;
+    }
+
+    setUploadHint("");
+    setUploading(true);
+
+    try {
+      const formData = new FormData();
+      formData.append("user_id", "123");
+      formData.append("file", selected);
+
+      const response = await fetch("/upload", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error("上传文件失败");
+      }
+
+      const payload = (await response.json()) as Partial<UploadedFile>;
+      if (!payload.file_url || !payload.file_name) {
+        throw new Error("上传返回数据格式错误");
+      }
+
+      const uploaded: UploadedFile = {
+        file_url: String(payload.file_url),
+        file_name: String(payload.file_name),
+        file_ext: String(payload.file_ext ?? ""),
+        file_size: Number(payload.file_size ?? 0),
+        mime_type: String(payload.mime_type ?? "application/octet-stream"),
+      };
+
+      setUploadedFiles((prev) => {
+        if (prev.length >= 3) {
+          return prev;
+        }
+        return [...prev, uploaded];
+      });
+      setUploadHint("");
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "上传失败，请稍后重试";
+      setUploadHint("上传文件失败");
+      setShowUploadFailToast(true);
+      if (uploadFailToastTimerRef.current !== null) {
+        window.clearTimeout(uploadFailToastTimerRef.current);
+      }
+      uploadFailToastTimerRef.current = window.setTimeout(() => {
+        setShowUploadFailToast(false);
+      }, 3000);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const removeUploadedFile = (indexToRemove: number) => {
+    setUploadedFiles((prev) => prev.filter((_, index) => index !== indexToRemove));
+  };
+
+  const triggerFileDownload = (file: UploadedFile) => {
+    const link = document.createElement("a");
+    link.href = file.file_url;
+    link.download = file.file_name || "download";
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
   const handleSend = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
     const trimmed = input.trim();
-    if (!trimmed && pendingFiles.length === 0) {
+    if (!trimmed && uploadedFiles.length === 0) {
       return;
     }
 
@@ -505,8 +625,8 @@ export default function Home() {
     const userMessageId = `user-${Date.now()}`;
     const assistantMessageId = `assistant-${Date.now()}`;
     const sendTime = nowString();
-    const fileNames = pendingFiles.map((file) => file.name);
-    const filesForSend = [...pendingFiles];
+    const filesForSend = [...uploadedFiles];
+    const fileNames = filesForSend.map((file) => file.file_name);
 
     updateDialogMessages(threadId, (messages) => [
       ...messages,
@@ -516,6 +636,7 @@ export default function Home() {
         content: trimmed,
         timestamp: sendTime,
         attachments: fileNames,
+        ...(filesForSend.length > 0 ? { files: filesForSend } : {}),
       },
       {
         id: assistantMessageId,
@@ -541,29 +662,14 @@ export default function Home() {
     );
 
     setInput("");
-    setPendingFiles([]);
+    setUploadedFiles([]);
 
     try {
-      const fileParts: FileUIPart[] = await Promise.all(
-        filesForSend.map(async (file) => {
-          const url = await toDataUrl(file);
-          return {
-            type: "file",
-            mediaType: file.type || "application/octet-stream",
-            filename: file.name,
-            url,
-          };
-        }),
-      );
-
       const outgoingMessage: UIMessage = {
         id: userMessageId,
         role: "user",
         metadata: { timestamp: sendTime },
-        parts: [
-          ...(fileParts as UIMessage["parts"]),
-          ...(trimmed ? ([{ type: "text", text: trimmed }] as UIMessage["parts"]) : []),
-        ],
+        parts: trimmed ? ([{ type: "text", text: trimmed }] as UIMessage["parts"]) : [],
       };
 
       const stream = await transport.sendMessages({
@@ -572,7 +678,7 @@ export default function Home() {
         messageId: undefined,
         messages: [outgoingMessage],
         abortSignal: undefined,
-        body: { thread_id: threadId },
+        body: { thread_id: threadId, user_id: "123", files: filesForSend },
       });
 
       const reader = stream.getReader();
@@ -899,6 +1005,36 @@ export default function Home() {
                     "flex max-w-[85%] flex-col gap-1",
                     message.role === "user" ? "items-end" : "items-start"
                   )}>
+                    {message.files && message.files.length > 0 && (
+                      <div className="flex flex-wrap gap-2">
+                        {message.files.map((file, fi) => (
+                          <button
+                            type="button"
+                            key={`${file.file_url}-${fi}`}
+                            onClick={() => triggerFileDownload(file)}
+                            className={clsx(
+                              "relative flex items-center gap-1.5 rounded-lg border px-2 py-1.5 text-left transition hover:opacity-90",
+                              theme === "dark" ? "border-slate-600 bg-slate-900/95" : "border-[var(--line)] bg-white/95"
+                            )}
+                            title={`下载 ${file.file_name}`}
+                          >
+                            <div className={clsx(
+                              "flex h-6 w-6 shrink-0 items-center justify-center rounded-md",
+                              theme === "dark" ? "bg-slate-700 text-slate-200" : "bg-[#f3ece3] text-[var(--text-soft)]"
+                            )}>
+                              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+                            </div>
+                            <span
+                              title={file.file_name}
+                              className="max-w-[140px] truncate text-[11px]"
+                            >
+                              {file.file_name}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+
                     <div
                       className={clsx(
                         "relative rounded-2xl px-4 py-2.5 shadow-sm border transition-colors",
@@ -907,14 +1043,6 @@ export default function Home() {
                           : (theme === "dark" ? "rounded-tl-none border-slate-800 bg-slate-900 text-slate-200" : "rounded-tl-none border-[var(--line)] bg-white text-[var(--text-main)]"),
                       )}
                     >
-                      {message.attachments && message.attachments.length > 0 && (
-                        <div className={clsx(
-                          "mb-2 rounded-lg border border-dashed px-2 py-1.5 text-xs",
-                          theme === "dark" ? "border-slate-700 bg-slate-800/50 text-slate-400" : "border-[#d2c6b6] bg-[#fdfaf5] text-[var(--text-soft)]"
-                        )}>
-                          <span className="font-semibold">附件:</span> {message.attachments.join(", ")}
-                        </div>
-                      )}
 
                       <div className={clsx(
                         "bubble-markdown prose prose-sm max-w-none break-words",
@@ -968,70 +1096,132 @@ export default function Home() {
               theme === "dark" ? "border-slate-700 bg-slate-800" : "border-[var(--line)] bg-white"
             )}
           >
-            <textarea
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key !== "Enter") {
-                  return;
-                }
+            <div className="flex items-stretch gap-3">
+              <div className="relative min-h-[190px] flex-1">
+                {uploadedFiles.length > 0 && (
+                  <div className={clsx(
+                    "absolute left-2 right-2 top-2 z-10 grid grid-cols-3 gap-2",
+                    theme === "dark" ? "" : ""
+                  )}>
+                    {uploadedFiles.map((file, index) => (
+                      <div
+                        key={`${file.file_url}-${index}`}
+                        className={clsx(
+                          "relative flex items-center gap-1.5 rounded-lg border px-2 py-1.5",
+                          theme === "dark" ? "border-slate-600 bg-slate-900/95" : "border-[var(--line)] bg-white/95"
+                        )}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => triggerFileDownload(file)}
+                          className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                          title={`下载 ${file.file_name}`}
+                        >
+                          <div className={clsx(
+                            "flex h-6 w-6 shrink-0 items-center justify-center rounded-md",
+                            theme === "dark" ? "bg-slate-700 text-slate-200" : "bg-[#f3ece3] text-[var(--text-soft)]"
+                          )}>
+                            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+                          </div>
+                          <span
+                            title={file.file_name}
+                            className="max-w-[110px] truncate text-[11px]"
+                          >
+                            {file.file_name}
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => removeUploadedFile(index)}
+                          className={clsx(
+                            "absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full border text-[9px]",
+                            theme === "dark"
+                              ? "border-slate-500 bg-slate-900 text-slate-300 hover:bg-slate-700"
+                              : "border-[#d9ccbb] bg-white text-[var(--text-soft)] hover:bg-[#fff2e9]"
+                          )}
+                          aria-label={`删除 ${file.file_name}`}
+                          title={`删除 ${file.file_name}`}
+                        >
+                          X
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
 
-                if (event.shiftKey) {
-                  return;
-                }
+                <textarea
+                  value={input}
+                  onChange={(event) => setInput(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key !== "Enter") {
+                      return;
+                    }
 
-                if (event.nativeEvent.isComposing) {
-                  return;
-                }
+                    if (event.shiftKey) {
+                      return;
+                    }
 
-                event.preventDefault();
-                formRef.current?.requestSubmit();
-              }}
-              rows={3}
-              placeholder="输入消息..."
-              className={clsx(
-                "w-full resize-none rounded-xl border px-3 py-2 text-sm outline-none transition-colors focus:border-[var(--accent)]",
-                theme === "dark" 
-                  ? "border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500" 
-                  : "border-[var(--line)] bg-white text-[var(--text-main)] placeholder:text-gray-400"
-              )}
-            />
+                    if (event.nativeEvent.isComposing) {
+                      return;
+                    }
 
-            <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-              <div className="flex flex-wrap items-center gap-2">
+                    event.preventDefault();
+                    formRef.current?.requestSubmit();
+                  }}
+                  rows={3}
+                  placeholder="输入消息..."
+                  className={clsx(
+                    "h-full w-full resize-none overflow-y-auto rounded-xl border px-3 pb-3 pt-3 text-sm outline-none transition-colors focus:border-[var(--accent)]",
+                    uploadedFiles.length > 0 ? "pt-[62px]" : "",
+                    theme === "dark"
+                      ? "border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500"
+                      : "border-[var(--line)] bg-white text-[var(--text-main)] placeholder:text-gray-400"
+                  )}
+                />
+              </div>
+
+              <div className="flex w-[108px] flex-col justify-between gap-2">
                 <label className={clsx(
-                  "cursor-pointer rounded-lg border px-3 py-2 text-sm transition",
+                  "flex items-center justify-center rounded-xl border px-3 py-2 text-sm font-medium transition",
+                  sending || uploading || uploadedFiles.length >= 3 ? "cursor-not-allowed opacity-70" : "cursor-pointer",
                   theme === "dark"
                     ? "border-slate-700 bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-slate-100"
                     : "border-[var(--line)] bg-white text-[var(--text-main)] hover:bg-[var(--accent-soft)]"
                 )}>
-                  上传文件
+                  {uploading ? (
+                    <span className="inline-flex items-center gap-1.5">
+                      <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                      上传中...
+                    </span>
+                  ) : (
+                    "上传文件"
+                  )}
                   <input
+                    ref={fileInputRef}
                     type="file"
-                    multiple
+                    disabled={sending || uploading || uploadedFiles.length >= 3}
                     className="hidden"
-                    onChange={(event) => {
-                      const files = event.target.files
-                        ? Array.from(event.target.files)
-                        : [];
-                      setPendingFiles(files);
-                    }}
+                    onChange={handleUploadFile}
                   />
                 </label>
-                {pendingFiles.length > 0 && (
-                  <span className="text-xs text-[var(--text-soft)]">
-                    已选择 {pendingFiles.length} 个文件
-                  </span>
-                )}
-              </div>
 
-              <button
-                type="submit"
-                disabled={sending}
-                className="rounded-xl bg-[var(--accent)] px-5 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {sending ? "发送中..." : "发送"}
-              </button>
+                <div className="min-h-5 text-center text-xs text-red-500">
+                  {uploadHint}
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={sending || uploading}
+                  className="rounded-xl bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {sending ? "发送中..." : "发送"}
+                </button>
+              </div>
+            </div>
+
+            <div className="flex min-h-4 items-center gap-3 text-xs text-[var(--text-soft)]">
+              {uploadedFiles.length > 0 && <span>已上传 {uploadedFiles.length}/3 个文件</span>}
+              {uploading && <span>文件上传中...</span>}
             </div>
 
             {errorText && <p className="text-xs text-red-600">{errorText}</p>}
@@ -1117,6 +1307,14 @@ export default function Home() {
                 保存并关闭
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {showUploadFailToast && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center pointer-events-none">
+          <div className="rounded-xl bg-black/80 px-6 py-4 text-base font-semibold text-white shadow-2xl">
+            ⚠️抱歉，文件上传失败
           </div>
         </div>
       )}
