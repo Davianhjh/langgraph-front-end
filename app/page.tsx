@@ -2,7 +2,7 @@
 
 import { TextStreamChatTransport, type FileUIPart, type UIMessage } from "ai";
 import clsx from "clsx";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -22,6 +22,9 @@ type Conversation = {
   title: string;
   messages: ChatMessage[];
   loaded: boolean;
+  dialogLoading?: boolean;
+  dialogHasMore?: boolean;
+  dialogPage?: number;
 };
 
 const transport = new TextStreamChatTransport({ api: "/api/chat" });
@@ -117,22 +120,9 @@ function normalizeRole(roleLike: unknown): Role {
   return "assistant";
 }
 
-function firstLine(input: string) {
-  const clean = input.replace(/\s+/g, " ").trim();
-  return clean || "新会话";
-}
-
 function limitTitle(input: string) {
-  // display at most 2 lines of 10 characters each (20 chars total)
   const text = String(input ?? "").replace(/\s+/g, " ").trim();
-  if (!text) return "新会话";
-  if (text.length <= 10) return text;
-  if (text.length <= 20) {
-    // insert a line break after 10 chars
-    return `${text.slice(0, 10)}\n${text.slice(10)}`;
-  }
-  // longer than 20: truncate and show ellipsis at end of second line
-  return `${text.slice(0, 10)}\n${text.slice(10, 20)}...`;
+  return text || "新会话";
 }
 
 function toDataUrl(file: File): Promise<string> {
@@ -239,9 +229,40 @@ function delay(ms: number) {
 
 export default function Home() {
   const [collapsed, setCollapsed] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(290);
+  const [isResizing, setIsResizing] = useState(false);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeThreadId, setActiveThreadId] = useState("");
   const sidebarRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isResizing) return;
+      let newWidth = e.clientX;
+      if (newWidth < 160) newWidth = 160;
+      if (newWidth > 480) newWidth = 480;
+      setSidebarWidth(newWidth);
+    };
+    const handleMouseUp = () => setIsResizing(false);
+
+    if (isResizing) {
+      window.addEventListener("mousemove", handleMouseMove);
+      window.addEventListener("mouseup", handleMouseUp);
+    }
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [isResizing]);
+
+  useEffect(() => {
+    // Only set on client side
+    const savedTheme = localStorage.getItem("app_theme") || "light";
+    const savedSize = localStorage.getItem("app_font_size") || "medium";
+    setTheme(savedTheme);
+    setFontSize(savedSize);
+  }, []);
+
   const [historyPage, setHistoryPage] = useState(1);
   const [historyPageSize] = useState(10);
   const [historyHasMore, setHistoryHasMore] = useState(true);
@@ -251,6 +272,9 @@ export default function Home() {
   const [booting, setBooting] = useState(true);
   const [sending, setSending] = useState(false);
   const [errorText, setErrorText] = useState("");
+  const [showSettings, setShowSettings] = useState(false);
+  const [theme, setTheme] = useState("light");
+  const [fontSize, setFontSize] = useState("medium");
   const messageBottomRef = useRef<HTMLDivElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
 
@@ -262,7 +286,7 @@ export default function Home() {
   const messagesContainerRef = useRef<HTMLDivElement | null>(null);
 
 
-  async function loadHistoryPage(page: number) {
+  const loadHistoryPage = useCallback(async (page: number) => {
     if (historyLoading) return;
     setHistoryLoading(true);
     try {
@@ -308,7 +332,7 @@ export default function Home() {
     } finally {
       setHistoryLoading(false);
     }
-  }
+  }, [historyLoading, historyPageSize]);
 
   useEffect(() => {
     const init = async () => {
@@ -324,31 +348,17 @@ export default function Home() {
     };
 
     void init();
-  }, []);
+  }, [loadHistoryPage]);
 
-  useEffect(() => {
-    // load initial dialog page when switching to a thread
-    const loadInitial = async () => {
-      if (!activeThreadId) return;
-
-      const target = conversations.find((item) => item.threadId === activeThreadId);
-      if (!target || target.loaded) return;
-
-      await loadDialogPageForThread(activeThreadId, 1);
-    };
-
-    void loadInitial();
-  }, [activeThreadId, conversations]);
-
-  async function loadDialogPageForThread(threadId: string, page: number) {
+  const loadDialogPageForThread = useCallback(async (threadId: string, page: number) => {
     const pageSize = 10;
     // find conversation
     const conv = conversations.find((c) => c.threadId === threadId);
     if (!conv) return;
 
     // avoid duplicate loads
-    const isLoading = (conv as any).dialogLoading as boolean | undefined;
-    const hasMore = (conv as any).dialogHasMore as boolean | undefined;
+    const isLoading = conv.dialogLoading;
+    const hasMore = conv.dialogHasMore;
     if (isLoading) return;
     if (page > 1 && hasMore === false) return;
 
@@ -394,7 +404,8 @@ export default function Home() {
               messages: chunk,
               loaded: true,
               dialogLoading: false,
-              ...({ dialogPage: 1, dialogHasMore: items.length >= pageSize } as any),
+              dialogPage: 1,
+              dialogHasMore: items.length >= pageSize,
             } as Conversation;
           }
 
@@ -406,7 +417,8 @@ export default function Home() {
             messages: [...toPrepend, ...existing],
             loaded: true,
             dialogLoading: false,
-            ...( { dialogPage: page, dialogHasMore: items.length >= pageSize } as any ),
+            dialogPage: page,
+            dialogHasMore: items.length >= pageSize,
           } as Conversation;
         }),
       );
@@ -420,7 +432,7 @@ export default function Home() {
         const newScrollHeight = newContainer.scrollHeight;
         newContainer.scrollTop = newScrollHeight - prevScrollHeight + prevScrollTop;
       }
-    } catch (err) {
+    } catch {
       // mark as loaded to avoid retry loops
       setConversations((prev) =>
         prev.map((c) =>
@@ -428,7 +440,21 @@ export default function Home() {
         ),
       );
     }
-  }
+  }, [conversations]);
+
+  useEffect(() => {
+    // load initial dialog page when switching to a thread
+    const loadInitial = async () => {
+      if (!activeThreadId) return;
+
+      const target = conversations.find((item) => item.threadId === activeThreadId);
+      if (!target || target.loaded) return;
+
+      await loadDialogPageForThread(activeThreadId, 1);
+    };
+
+    void loadInitial();
+  }, [activeThreadId, conversations, loadDialogPageForThread]);
 
   const createNewDialog = () => {
     const threadId = generateThreadId();
@@ -641,19 +667,38 @@ export default function Home() {
   };
 
   return (
-    <div className="chat-shell flex h-screen w-full overflow-hidden">
+    <div
+      className={clsx(
+        "chat-shell flex h-screen w-full overflow-hidden transition-all duration-300",
+        fontSize === "small" ? "text-xs" : fontSize === "large" ? "text-lg" : "text-sm",
+        theme === "dark" ? "bg-slate-950 text-slate-100 dark" : "bg-[var(--bg-main)] text-[var(--text-main)]"
+      )}
+      style={{
+        fontSize: fontSize === "small" ? "0.85rem" : fontSize === "large" ? "1.2rem" : "1rem"
+      }}
+    >
       <aside
         className={clsx(
-          "border-r border-[var(--line)] bg-[var(--bg-panel)] transition-all duration-300 h-full",
-          collapsed ? "w-[74px]" : "w-[290px]",
+          "relative flex shrink-0 flex-col border-r transition-all duration-300 h-full",
+          theme === "dark" ? "border-slate-800 bg-slate-900" : "border-[var(--line)] bg-[var(--bg-panel)]",
+          collapsed ? "w-[74px]" : ""
         )}
+        style={{ width: collapsed ? "74px" : `${sidebarWidth}px` }}
       >
-        <div className="flex h-full flex-col">
-          <div className="flex items-center justify-between gap-2 border-b border-[var(--line)] px-3 py-3">
+        <div className="flex h-full flex-col overflow-hidden">
+          <div className={clsx(
+            "flex items-center justify-between gap-2 border-b px-3 py-3",
+            theme === "dark" ? "border-slate-800" : "border-[var(--line)]"
+          )}>
             <button
               type="button"
               onClick={() => setCollapsed((value) => !value)}
-              className="rounded-lg border border-[var(--line)] bg-white px-2 py-1 text-sm text-[var(--text-main)] hover:bg-[var(--accent-soft)]"
+              className={clsx(
+                "rounded-lg border px-2 py-1 text-sm transition",
+                theme === "dark" 
+                  ? "border-slate-700 bg-slate-800 text-slate-300 hover:bg-slate-700" 
+                  : "border-[var(--line)] bg-white text-[var(--text-main)] hover:bg-[var(--accent-soft)]"
+              )}
             >
               {collapsed ? "展开" : "收起"}
             </button>
@@ -661,7 +706,7 @@ export default function Home() {
               <button
                 type="button"
                 onClick={createNewDialog}
-                className="rounded-lg bg-[var(--bg-strong)] px-3 py-1.5 text-sm font-semibold text-white hover:opacity-90"
+                className="rounded-lg bg-[var(--accent)] px-3 py-1.5 text-sm font-semibold text-white hover:opacity-90"
               >
                 新建对话
               </button>
@@ -689,20 +734,35 @@ export default function Home() {
                   onClick={() => setActiveThreadId(conversation.threadId)}
                   title={conversation.title}
                   className={clsx(
-                    "mb-2 flex w-full items-center gap-2 rounded-xl border px-2 py-2 text-left transition",
+                    "mb-2 flex w-full items-center gap-2 rounded-xl border px-3 py-2 text-left transition",
                     active
-                      ? "border-[var(--accent)] bg-[var(--accent-soft)]"
-                      : "border-transparent bg-white hover:border-[var(--line)]",
+                      ? (theme === "dark" ? "border-orange-500 bg-slate-800 shadow-sm" : "border-[var(--accent)] bg-[var(--accent-soft)] shadow-sm")
+                      : (theme === "dark" ? "border-transparent hover:border-slate-700" : "border-transparent bg-white hover:border-[var(--line)]"),
                     collapsed ? "justify-center" : "",
                   )}
                 >
-                  <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--bg-strong)] text-xs font-semibold text-white">
-                    {active ? "●" : "○"}
-                  </span>
-                  {!collapsed && (
+                  {collapsed ? (
+                    <div className={clsx(
+                      "flex h-8 w-8 items-center justify-center rounded-full transition-all",
+                      active 
+                        ? "bg-[var(--accent)] text-white scale-110 shadow-md" 
+                        : (theme === "dark" ? "bg-slate-800 text-slate-500 hover:bg-slate-700" : "bg-gray-100 text-gray-400 hover:bg-gray-200")
+                    )}>
+                      {conversation.title.charAt(0).toUpperCase() || "C"}
+                    </div>
+                  ) : (
                     <span
-                      className="text-sm text-[var(--text-main)]"
-                      style={{ whiteSpace: "pre-line" }}
+                      className={clsx(
+                        "text-sm flex-1 break-all line-clamp-2",
+                        active 
+                          ? (theme === "dark" ? "font-semibold text-orange-400" : "font-semibold text-[var(--accent)]")
+                          : (theme === "dark" ? "text-slate-300" : "text-[var(--text-main)]")
+                      )}
+                      style={{ 
+                        display: '-webkit-box',
+                        WebkitBoxOrient: 'vertical',
+                        WebkitLineClamp: 2,
+                      }}
                     >
                       {limitTitle(conversation.title)}
                     </span>
@@ -711,13 +771,65 @@ export default function Home() {
               );
             })}
           </div>
+
+          <div className={clsx(
+            "border-t px-2 py-4",
+            theme === "dark" ? "border-slate-800" : "border-[var(--line)]"
+          )}>
+            <button
+              onClick={() => setShowSettings(true)}
+              className={clsx(
+                "flex w-full items-center gap-2 rounded-xl border border-transparent px-3 py-2 text-left transition",
+                theme === "dark" ? "hover:bg-slate-800 text-slate-300" : "hover:bg-[var(--accent-soft)] hover:border-[var(--line)]",
+                collapsed ? "justify-center" : ""
+              )}
+              title="设置"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="20"
+                height="20"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="shrink-0"
+              >
+                <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+              {!collapsed && <span className="text-sm font-medium">设置</span>}
+            </button>
+          </div>
         </div>
+
+        {/* Resize Handle */}
+        {!collapsed && (
+          <div
+            onMouseDown={() => setIsResizing(true)}
+            className={clsx(
+              "absolute right-0 top-0 z-10 h-full w-1 cursor-col-resize transition-all hover:w-1.5 hover:bg-[var(--accent)]",
+              isResizing ? "w-1.5 bg-[var(--accent)]" : "bg-transparent"
+            )}
+          />
+        )}
       </aside>
 
-      <main className="flex h-screen flex-1 flex-col overflow-hidden">
-        <header className="shrink-0 border-b border-[var(--line)] bg-white/70 px-5 py-4 backdrop-blur">
+      <main className={clsx(
+        "flex h-screen flex-1 flex-col overflow-hidden transition-colors duration-300",
+        theme === "dark" ? "bg-slate-950" : "bg-white"
+      )}>
+        <header className={clsx(
+          "shrink-0 border-b px-5 py-4 backdrop-blur transition-colors duration-300",
+          theme === "dark" ? "border-slate-800 bg-slate-900/70 text-slate-100" : "border-[var(--line)] bg-white/70 text-[var(--text-main)]"
+        )}>
           <h1 className="font-mono text-lg font-semibold tracking-tight">AI Agent 对话</h1>
-          <p className="mt-1 text-sm text-[var(--text-soft)]">
+          <p className={clsx(
+            "mt-1 text-sm",
+            theme === "dark" ? "text-slate-400" : "text-[var(--text-soft)]"
+          )}>
             当前会话ID: {activeThreadId || "-"}
           </p>
         </header>
@@ -727,7 +839,7 @@ export default function Home() {
           onScroll={(e) => {
             const el = e.currentTarget as HTMLDivElement;
             if (!activeConversation) return;
-            const meta = (activeConversation as any);
+            const meta = activeConversation;
             if (meta.dialogLoading) return;
             if (meta.dialogHasMore === false) return;
             const threshold = 120;
@@ -739,75 +851,122 @@ export default function Home() {
           className="messages-scroll flex-1 overflow-y-auto px-4 py-5 md:px-8"
         >
           {booting ? (
-            <div className="rounded-xl border border-[var(--line)] bg-white p-6 text-sm text-[var(--text-soft)]">
+            <div className={clsx(
+              "rounded-xl border p-6 text-sm",
+              theme === "dark" ? "border-slate-800 bg-slate-900 text-slate-400" : "border-[var(--line)] bg-white text-[var(--text-soft)]"
+            )}>
               正在加载历史会话...
             </div>
           ) : activeConversation?.messages.length ? (
-            <div className="mx-auto flex w-full max-w-4xl flex-col gap-4">
+            <div className="mx-auto flex w-full max-w-4xl flex-col gap-6">
               {activeConversation.messages.map((message) => (
                 <article
                   key={message.id}
                   className={clsx(
-                    "rounded-2xl border p-4 shadow-sm",
-                    message.role === "user"
-                      ? "border-[#cde3f8] bg-[var(--user)]"
-                      : "border-[#eadfcf] bg-[var(--assistant)]",
+                    "flex w-full gap-3",
+                    message.role === "user" ? "flex-row-reverse" : "flex-row"
                   )}
                 >
-                  <div className="mb-2 flex items-center justify-between gap-2 text-xs text-[var(--text-soft)]">
-                    <div className="flex items-center gap-2">
-                      <span
-                        className={clsx(
-                          "flex h-7 w-7 items-center justify-center rounded-full text-xs font-semibold",
-                          message.role === "user"
-                            ? "bg-[#2f6da5] text-white"
-                            : "bg-[#b75528] text-white",
-                        )}
-                      >
-                        {message.role === "user" ? "U" : "A"}
-                      </span>
-                      <span>{message.role === "user" ? "用户" : "Agent"}</span>
+                  {/* Avatar & Name */}
+                  <div className={clsx(
+                    "flex flex-col items-center shrink-0 w-12",
+                    message.role === "user" ? "items-end" : "items-start"
+                  )}>
+                    <div
+                      className={clsx(
+                        "flex h-9 w-9 items-center justify-center rounded-full text-xs font-semibold shadow-sm overflow-hidden",
+                        message.role === "user"
+                          ? "bg-[var(--accent)] text-white"
+                          : (theme === "dark" ? "bg-slate-800 text-slate-300 border border-slate-700" : "bg-[#4a5568] text-white"),
+                      )}
+                    >
+                      {message.role === "user" ? (
+                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+                      ) : (
+                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 8V4H8"></path><rect width="16" height="12" x="4" y="8" rx="2"></rect><path d="M2 14h2"></path><path d="M20 14h2"></path><path d="M15 13v2"></path><path d="M9 13v2"></path></svg>
+                      )}
                     </div>
-                    <time>{message.timestamp}</time>
+                    <span className={clsx(
+                      "mt-1 text-[10px] font-medium truncate max-w-full",
+                      theme === "dark" ? "text-slate-500" : "text-[var(--text-soft)]"
+                    )}>
+                      {message.role === "user" ? "用户" : "Agent"}
+                    </span>
                   </div>
 
-                  {message.attachments && message.attachments.length > 0 && (
-                    <div className="mb-2 rounded-lg border border-dashed border-[#d2c6b6] bg-[#fffaf1] px-3 py-2 text-xs text-[var(--text-soft)]">
-                      文件: {message.attachments.join(", ")}
-                    </div>
-                  )}
-
-                  <div className="bubble-markdown text-sm text-[var(--text-main)]">
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      components={{
-                        a: ({ ...props }) => (
-                          <a {...props} target="_blank" rel="noopener noreferrer" />
-                        ),
-                      }}
-                    >
-                      {normalizeReplyText(
-                        message.content || (message.isStreaming ? "正在思考中..." : ""),
+                  {/* Body: Bubble + Attachments + Time */}
+                  <div className={clsx(
+                    "flex max-w-[85%] flex-col gap-1",
+                    message.role === "user" ? "items-end" : "items-start"
+                  )}>
+                    <div
+                      className={clsx(
+                        "relative rounded-2xl px-4 py-2.5 shadow-sm border transition-colors",
+                        message.role === "user"
+                          ? (theme === "dark" ? "rounded-tr-none border-orange-900/50 bg-orange-900/20 text-orange-100" : "rounded-tr-none border-[#f9dcc4] bg-[#fff0e6] text-[var(--text-main)]")
+                          : (theme === "dark" ? "rounded-tl-none border-slate-800 bg-slate-900 text-slate-200" : "rounded-tl-none border-[var(--line)] bg-white text-[var(--text-main)]"),
                       )}
-                    </ReactMarkdown>
-                    {message.isStreaming && <span className="typing-caret">|</span>}
+                    >
+                      {message.attachments && message.attachments.length > 0 && (
+                        <div className={clsx(
+                          "mb-2 rounded-lg border border-dashed px-2 py-1.5 text-xs",
+                          theme === "dark" ? "border-slate-700 bg-slate-800/50 text-slate-400" : "border-[#d2c6b6] bg-[#fdfaf5] text-[var(--text-soft)]"
+                        )}>
+                          <span className="font-semibold">附件:</span> {message.attachments.join(", ")}
+                        </div>
+                      )}
+
+                      <div className={clsx(
+                        "bubble-markdown prose prose-sm max-w-none break-words",
+                        theme === "dark" ? "prose-invert" : ""
+                      )}>
+                        <ReactMarkdown
+                          remarkPlugins={[remarkGfm]}
+                          components={{
+                            a: ({ ...props }) => (
+                              <a {...props} target="_blank" rel="noopener noreferrer" className="text-blue-500 underline" />
+                            ),
+                          }}
+                        >
+                          {normalizeReplyText(
+                            message.content || (message.isStreaming ? "正在思考中..." : ""),
+                          )}
+                        </ReactMarkdown>
+                        {message.isStreaming && <span className="typing-caret">|</span>}
+                      </div>
+                    </div>
+                    <time className={clsx(
+                      "text-[0.85em] px-1 mt-1 opacity-80 font-medium",
+                      theme === "dark" ? "text-slate-500" : "text-[var(--text-soft)]"
+                    )}>
+                      {message.timestamp}
+                    </time>
                   </div>
                 </article>
               ))}
               <div ref={messageBottomRef} />
             </div>
           ) : (
-            <div className="mx-auto mt-6 max-w-2xl rounded-2xl border border-[var(--line)] bg-white p-8 text-center text-sm text-[var(--text-soft)] shadow-[var(--shadow)]">
+            <div className={clsx(
+              "mx-auto mt-6 max-w-2xl rounded-2xl border p-8 text-center text-sm shadow-[var(--shadow)]",
+              theme === "dark" ? "border-slate-800 bg-slate-900 text-slate-500" : "border-[var(--line)] bg-white text-[var(--text-soft)]"
+            )}>
               开始新对话，支持输入文本和上传文件。
             </div>
           )}
         </section>
 
-        <footer className="shrink-0 border-t border-[var(--line)] bg-[var(--bg-panel)] p-4">
+        <footer className={clsx(
+          "shrink-0 border-t p-4 transition-colors duration-300",
+          theme === "dark" ? "border-slate-800 bg-slate-900" : "border-[var(--line)] bg-[var(--bg-panel)]"
+        )}>
           <form
             ref={formRef}
             onSubmit={handleSend}
-            className="mx-auto flex w-full max-w-4xl flex-col gap-3 rounded-2xl border border-[var(--line)] bg-white p-3"
+            className={clsx(
+              "mx-auto flex w-full max-w-4xl flex-col gap-3 rounded-2xl border p-3 shadow-sm",
+              theme === "dark" ? "border-slate-700 bg-slate-800" : "border-[var(--line)] bg-white"
+            )}
           >
             <textarea
               value={input}
@@ -830,12 +989,22 @@ export default function Home() {
               }}
               rows={3}
               placeholder="输入消息..."
-              className="w-full resize-none rounded-xl border border-[var(--line)] px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+              className={clsx(
+                "w-full resize-none rounded-xl border px-3 py-2 text-sm outline-none transition-colors focus:border-[var(--accent)]",
+                theme === "dark" 
+                  ? "border-slate-700 bg-slate-800 text-slate-100 placeholder:text-slate-500" 
+                  : "border-[var(--line)] bg-white text-[var(--text-main)] placeholder:text-gray-400"
+              )}
             />
 
             <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
               <div className="flex flex-wrap items-center gap-2">
-                <label className="cursor-pointer rounded-lg border border-[var(--line)] px-3 py-2 text-sm text-[var(--text-main)] hover:bg-[var(--accent-soft)]">
+                <label className={clsx(
+                  "cursor-pointer rounded-lg border px-3 py-2 text-sm transition",
+                  theme === "dark"
+                    ? "border-slate-700 bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-slate-100"
+                    : "border-[var(--line)] bg-white text-[var(--text-main)] hover:bg-[var(--accent-soft)]"
+                )}>
                   上传文件
                   <input
                     type="file"
@@ -869,6 +1038,88 @@ export default function Home() {
           </form>
         </footer>
       </main>
+
+      {showSettings && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+          <div className={clsx(
+            "w-full max-w-md rounded-2xl p-6 shadow-2xl animate-in fade-in zoom-in duration-200",
+            theme === "dark" ? "bg-slate-900 text-slate-100" : "bg-white text-[var(--text-main)]"
+          )}>
+            <div className={clsx(
+              "mb-6 flex items-center justify-between border-b pb-4",
+              theme === "dark" ? "border-slate-800" : "border-gray-100"
+            )}>
+              <h2 className="text-xl font-bold">设置 (Preference)</h2>
+              <button
+                onClick={() => setShowSettings(false)}
+                className={clsx(
+                  "rounded-full p-1 transition",
+                  theme === "dark" ? "hover:bg-slate-800" : "hover:bg-gray-100"
+                )}
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+              </button>
+            </div>
+
+            <div className="space-y-6">
+              <div>
+                <label className="mb-2 block text-sm font-semibold">主题 (Theme)</label>
+                <div className="grid grid-cols-2 gap-3">
+                  {['light', 'dark'].map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => {
+                        setTheme(t);
+                        localStorage.setItem("app_theme", t);
+                      }}
+                      className={clsx(
+                        "rounded-xl border-2 px-4 py-2 text-sm font-medium transition-all",
+                        theme === t
+                          ? (theme === "dark" ? "border-orange-500 bg-orange-500/10 text-orange-400" : "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]")
+                          : (theme === "dark" ? "border-slate-800 bg-slate-800 text-slate-400 hover:border-slate-700" : "border-[var(--line)] bg-white text-[var(--text-soft)] hover:border-[var(--text-soft)]")
+                      )}
+                    >
+                      {t === 'light' ? '明亮模式' : '暗黑模式'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="mb-2 block text-sm font-semibold">字体大小 (Font Size)</label>
+                <div className="grid grid-cols-3 gap-3">
+                  {['small', 'medium', 'large'].map((s) => (
+                    <button
+                      key={s}
+                      onClick={() => {
+                        setFontSize(s);
+                        localStorage.setItem("app_font_size", s);
+                      }}
+                      className={clsx(
+                        "rounded-xl border-2 px-3 py-2 text-sm font-medium transition-all",
+                        fontSize === s
+                          ? (theme === "dark" ? "border-orange-500 bg-orange-500/10 text-orange-400" : "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]")
+                          : (theme === "dark" ? "border-slate-800 bg-slate-800 text-slate-400 hover:border-slate-700" : "border-[var(--line)] bg-white text-[var(--text-soft)] hover:border-[var(--text-soft)]")
+                      )}
+                    >
+                      {s === 'small' ? '小' : s === 'medium' ? '中' : '大'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-8 flex justify-end">
+              <button
+                onClick={() => setShowSettings(false)}
+                className="rounded-xl bg-[var(--accent)] px-6 py-2.5 text-sm font-semibold text-white shadow-lg shadow-orange-900/20 transition-all hover:opacity-90 active:scale-95"
+              >
+                保存并关闭
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
